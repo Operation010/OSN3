@@ -437,3 +437,99 @@ edfs_add_dir_entry(edfs_image_t *img,
   free(buf);
   return rc;
 }
+
+/* ================================================================= *
+ *  edfs_ensure_block                                                *
+ * ================================================================= */
+int
+edfs_ensure_block(edfs_image_t *img,
+                  edfs_inode_t *inode,
+                  uint32_t      idx,
+                  edfs_block_t *block_out)
+{
+  const uint32_t bs      = img->sb.block_size;
+  const uint32_t per_ind = edfs_get_n_blocks_per_indirect_block(&img->sb);
+
+  /* --- direct blocks case --------------------------------------- */
+  if (!edfs_disk_inode_has_indirect(&inode->inode))
+    {
+      if (idx >= EDFS_INODE_N_BLOCKS)
+        {
+          /* need to convert to indirect */
+          edfs_block_t ind_blk;
+          int rc = edfs_alloc_block(img, &ind_blk);
+          if (rc < 0) return rc;
+
+          /* zero-initialise indirect block */
+          size_t bytes = bs;
+          void *zero = calloc(1, bytes);
+          pwrite(img->fd, zero, bytes,
+                 edfs_get_block_offset(&img->sb, ind_blk));
+          free(zero);
+
+          /* copy old direct pointers into indirect block */
+          edfs_block_t copy[EDFS_INODE_N_BLOCKS];
+          memcpy(copy, inode->inode.blocks,
+                 sizeof(edfs_block_t)*EDFS_INODE_N_BLOCKS);
+          pwrite(img->fd, copy,
+                 sizeof(copy),
+                 edfs_get_block_offset(&img->sb, ind_blk));
+
+          memset(inode->inode.blocks, 0,
+                 sizeof(edfs_block_t)*EDFS_INODE_N_BLOCKS);
+          inode->inode.blocks[0] = ind_blk;
+          inode->inode.type |= EDFS_INODE_TYPE_INDIRECT;
+          edfs_write_inode(img, inode);
+        }
+      else
+        {
+          /* still in direct range */
+          if (inode->inode.blocks[idx] == EDFS_BLOCK_INVALID)
+            {
+              int rc = edfs_alloc_block(img, &inode->inode.blocks[idx]);
+              if (rc < 0) return rc;
+              edfs_write_inode(img, inode);
+            }
+          *block_out = inode->inode.blocks[idx];
+          return 0;
+        }
+    }
+
+  /* --- indirect case -------------------------------------------- */
+  uint32_t slot   = idx / per_ind;
+  uint32_t offset = idx % per_ind;
+  if (slot >= EDFS_INODE_N_BLOCKS)
+    return -EFBIG;
+
+  /* ensure indirect block present */
+  if (inode->inode.blocks[slot] == EDFS_BLOCK_INVALID)
+    {
+      int rc = edfs_alloc_block(img, &inode->inode.blocks[slot]);
+      if (rc < 0) return rc;
+
+      void *zero = calloc(1, bs);
+      pwrite(img->fd, zero, bs,
+             edfs_get_block_offset(&img->sb, inode->inode.blocks[slot]));
+      free(zero);
+      edfs_write_inode(img, inode);
+    }
+
+  /* load indirect block */
+  edfs_block_t *array = malloc(bs);
+  if (!array) return -ENOMEM;
+  pread(img->fd, array, bs,
+        edfs_get_block_offset(&img->sb, inode->inode.blocks[slot]));
+
+  if (array[offset] == EDFS_BLOCK_INVALID)
+    {
+      int rc = edfs_alloc_block(img, &array[offset]);
+      if (rc < 0) { free(array); return rc; }
+
+      pwrite(img->fd, array, bs,
+             edfs_get_block_offset(&img->sb, inode->inode.blocks[slot]));
+    }
+
+  *block_out = array[offset];
+  free(array);
+  return 0;
+}

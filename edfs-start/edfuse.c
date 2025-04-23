@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <limits.h>
+#include <utime.h>
 
 #include <stdbool.h>
 
@@ -450,15 +451,39 @@ edfuse_open(const char *path, struct fuse_file_info *fi)
 static int
 edfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
-  /* TODO: implement
-   *
-   * See also Section 4.4 of the Appendices document.
-   *
-   * Create a new inode, attempt to register in parent directory,
-   * write inode to disk.
-   */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+
+  /* parent dir */
+  edfs_inode_t parent;
+  int rc = edfs_get_parent_inode(img, path, &parent);
+  if (rc < 0) return rc;
+
+  if (!edfs_disk_inode_is_directory(&parent.inode))
+    return -ENOTDIR;
+
+  char *name = edfs_get_basename(path);
+  if (!name) return -EINVAL;
+
+  /* already exists? */
+  edfs_lookup_ctx_t ctx = { .want = name, .found = false };
+  edfs_scan_directory(img, &parent, lookup_cb, &ctx);
+  if (ctx.found) { free(name); return -EEXIST; }
+
+  /* make new inode */
+  edfs_inode_t child;
+  rc = edfs_new_inode(img, &child, EDFS_INODE_TYPE_FILE);
+  if (rc < 0) { free(name); return rc; }
+
+  child.inode.size = 0;
+  rc = edfs_write_inode(img, &child);
+  if (rc < 0) { free(name); return rc; }
+
+  /* dir entry */
+  rc = edfs_add_dir_entry(img, &parent, name, child.inumber);
+  free(name);
+  return rc;
 }
+
 
 /* Since we don't maintain link count, we'll treat unlink as a file
  * remove operation.
@@ -466,13 +491,81 @@ edfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 static int
 edfuse_unlink(const char *path)
 {
-  /* Validate @path exists and is not a directory; remove directory entry
-   * from parent directory; release allocated blocks; release inode.
-   */
+  edfs_image_t *img = get_edfs_image();
 
-  /* NOTE: Not implemented and not part of the assignment. */
-  return -ENOSYS;
+  /* 1. locate inode */
+  edfs_inode_t inode;
+  if (!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+
+  if (edfs_disk_inode_is_directory(&inode.inode))
+    return -EISDIR;
+
+  /* 2. free all data blocks */
+  uint16_t bs = img->sb.block_size;
+  uint32_t per_ind = edfs_get_n_blocks_per_indirect_block(&img->sb);
+
+  if (edfs_disk_inode_has_indirect(&inode.inode))
+    {
+      for (int slot = 0; slot < EDFS_INODE_N_BLOCKS; ++slot)
+        {
+          edfs_block_t ind_blk = inode.inode.blocks[slot];
+          if (ind_blk == EDFS_BLOCK_INVALID) continue;
+
+          /* read indirect array */
+          edfs_block_t *ary = malloc(bs);
+          pread(img->fd, ary, bs,
+                edfs_get_block_offset(&img->sb, ind_blk));
+
+          for (uint32_t i = 0; i < per_ind; ++i)
+            if (ary[i] != EDFS_BLOCK_INVALID)
+              edfs_free_block(img, ary[i]);
+
+          free(ary);
+          edfs_free_block(img, ind_blk);
+        }
+    }
+  else
+    {
+      for (int i = 0; i < EDFS_INODE_N_BLOCKS; ++i)
+        if (inode.inode.blocks[i] != EDFS_BLOCK_INVALID)
+          edfs_free_block(img, inode.inode.blocks[i]);
+    }
+
+  /* 3. remove directory entry from parent */
+  edfs_inode_t parent;
+  int rc = edfs_get_parent_inode(img, path, &parent);
+  if (rc < 0) return rc;
+
+  const uint16_t ents = edfs_get_n_dir_entries_per_block(&img->sb);
+  edfs_dir_entry_t *buf = malloc(bs);
+
+  for (int i = 0; i < EDFS_INODE_N_BLOCKS; ++i)
+    {
+      edfs_block_t blk = parent.inode.blocks[i];
+      if (blk == EDFS_BLOCK_INVALID) continue;
+
+      off_t off = edfs_get_block_offset(&img->sb, blk);
+      pread(img->fd, buf, bs, off);
+
+      for (uint16_t j = 0; j < ents; ++j)
+        if (buf[j].inumber == inode.inumber)
+          {
+            memset(&buf[j], 0, sizeof(edfs_dir_entry_t));
+            pwrite(img->fd, buf, bs, off);
+            free(buf);
+            goto removed;
+          }
+    }
+  free(buf);
+  return -EIO;                       /* should not happen */
+
+removed:
+  /* 4. clear inode */
+  edfs_clear_inode(img, &inode);
+  return 0;
 }
+
 
 static int
 edfuse_read(const char *path, char *buf, size_t size, off_t offset,
@@ -529,31 +622,121 @@ static int
 edfuse_write(const char *path, const char *buf, size_t size, off_t offset,
              struct fuse_file_info *fi)
 {
-  /* TODO: implement
-   *
-   * See also Section 4.4 of the Appendices document.
-   *
-   * Write @size bytes of data from @buf to @path starting at @offset.
-   * Allocate new blocks as necessary. You may have to fill holes! Update
-   * the file size if necessary.
-   */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+
+  edfs_inode_t inode;
+  if (!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+  if (edfs_disk_inode_is_directory(&inode.inode))
+    return -EISDIR;
+
+  size_t bytes_left = size;
+  size_t written    = 0;
+
+  while (bytes_left > 0)
+    {
+      uint16_t bs = img->sb.block_size;
+      uint32_t logical = (offset + written) / bs;
+      off_t    inblk   = (offset + written) % bs;
+
+      edfs_block_t blk;
+      int rc = edfs_ensure_block(img, &inode, logical, &blk);
+      if (rc < 0) return rc;
+
+      size_t chunk = bs - inblk;
+      if (chunk > bytes_left) chunk = bytes_left;
+
+      if (pwrite(img->fd, buf + written, chunk,
+                 edfs_get_block_offset(&img->sb, blk) + inblk) != (ssize_t)chunk)
+        return -EIO;
+
+      written    += chunk;
+      bytes_left -= chunk;
+    }
+
+  /* update file size if extended */
+  if (offset + written > inode.inode.size)
+    {
+      inode.inode.size = offset + written;
+      edfs_write_inode(img, &inode);
+    }
+  return written;
 }
 
 
 static int
-edfuse_truncate(const char *path, off_t offset)
+edfuse_truncate(const char *path, off_t new_size)
 {
-  /* TODO: implement
-   *
-   * See also Section 4.4 of the Appendices document.
-   *
-   * The size of @path must be set to be @offset. Release now superfluous
-   * blocks or allocate new blocks that are necessary to cover offset.
-   */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+  edfs_inode_t inode;
+
+  if (!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+  if (edfs_disk_inode_is_directory(&inode.inode))
+    return -EISDIR;
+  if (new_size < 0) return -EINVAL;
+
+  uint16_t bs = img->sb.block_size;
+
+  /* extend: just ensure last block exists */
+  if ((uint32_t)new_size > inode.inode.size)
+    {
+      if (new_size != 0)
+        {
+          uint32_t last_idx = (new_size - 1) / bs;
+          edfs_block_t blk;
+          int rc = edfs_ensure_block(img, &inode, last_idx, &blk);
+          if (rc < 0) return rc;
+        }
+    }
+  /* shrink: we only free whole blocks beyond new_size */
+  else
+    {
+      uint32_t old_last = (inode.inode.size + bs - 1) / bs;
+      uint32_t new_last = (new_size        + bs - 1) / bs;
+      for (uint32_t i = new_last; i < old_last; ++i)
+        {
+          off_t dummy;
+          edfs_block_t blk;
+          if (edfs_block_for_offset(img, &inode, i*bs, &blk, &dummy) == 0)
+            edfs_free_block(img, blk);
+        }
+    }
+
+  inode.inode.size = new_size;
+  if (edfs_write_inode(img, &inode) < 0)
+  return -EIO;
+
+  return 0;
 }
 
+/* Some userland tools call utimens; we ignore time updates. */
+static int
+edfuse_utime(const char *path, struct utimbuf *buf)
+{
+  (void)path; (void)buf;
+  return 0;                 /* accept but ignore */
+}
+
+/* ftruncate on an open file-handle — delegate to our truncate logic */
+static int
+edfuse_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
+{
+  (void)fi;                 /* we don’t use the file-info */
+  return edfuse_truncate(path, size);
+}
+
+static int edfuse_chmod(const char *path, mode_t mode)
+{
+  (void)path; (void)mode;
+  return 0;             /* ignore permission changes */
+}
+
+static int edfuse_chown(const char *path, uid_t uid, gid_t gid)
+{
+  (void)path; (void)uid; (void)gid;
+  return 0;             /* ignore ownership changes */
+}
 
 /*
  * FUSE setup
@@ -570,7 +753,11 @@ static struct fuse_operations edfs_oper =
   .unlink    = edfuse_unlink,
   .read      = edfuse_read,
   .write     = edfuse_write,
+  .chmod     = edfuse_chmod,     
+  .chown     = edfuse_chown,
   .truncate  = edfuse_truncate,
+  .ftruncate = edfuse_ftruncate,
+  .utime  = edfuse_utime,
 };
 
 int

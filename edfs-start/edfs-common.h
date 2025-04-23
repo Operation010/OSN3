@@ -110,5 +110,18 @@ int edfs_add_dir_entry(edfs_image_t       *img,
                        const char         *name,
                        edfs_inumber_t      inumber);
 
+/* ------------------------------------------------------------- *
+ *  Block-ensure helper (needed for write / truncate)            *
+ * ------------------------------------------------------------- */
+
+/* Make sure data block #logical_idx exists for @inode.
+ * Allocates data blocks (and indirect blocks) as needed and
+ * writes the inode back to disk when it changes.
+ * Returns 0 on success, negative errno on failure.               */
+int edfs_ensure_block(edfs_image_t *img,
+  edfs_inode_t *inode,          /* may be modified */
+  uint32_t      logical_idx,
+  edfs_block_t *block_out);
+
  #endif /* __EDFS_COMMON_H__ */
  
